@@ -1,0 +1,775 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1351.h>
+
+#define OLED_PIN_DC 8
+#define OLED_PIN_RST 7
+#define OLED_PIN_CS -1 //UNUSED
+//cs pin can be connected straight to GND, because it is the only SPI device connected
+Adafruit_SSD1351 disp = Adafruit_SSD1351(OLED_PIN_CS, OLED_PIN_DC, OLED_PIN_RST);
+#define SCREEN_WIDTH_PIXELS 128
+#define SCREEN_HEIGHT_PIXELS 128
+// Color definitions
+#define BLACK           0x0000
+#define BLUE            0x001F
+#define RED             0xF800
+#define GREEN           0x07E0
+#define CYAN            0x07FF
+#define MAGENTA         0xF81F
+#define YELLOW          0xFFE0
+#define WHITE           0xFFFF
+#define GRAY            0x2222
+#define DARK_GRAY       0x0101
+
+#define CHAR_WIDTH 5
+#define CHAR_HEIGHT 8
+#define FRAME_TIME_Y SCREEN_HEIGHT_PIXELS - (CHAR_HEIGHT + 2) - 6
+#define FRAME_TIME_X SCREEN_WIDTH_PIXELS / 2
+#define FREQ_Y FRAME_TIME_Y - (CHAR_HEIGHT + 2)
+#define FREQ_X FRAME_TIME_X
+#define AXIS_TICK_WIDTH 2
+const int ticks[] = {0, SCREEN_HEIGHT_PIXELS / 5, SCREEN_HEIGHT_PIXELS * 2 / 5, SCREEN_HEIGHT_PIXELS * 3 / 5, SCREEN_HEIGHT_PIXELS * 4 / 5, SCREEN_HEIGHT_PIXELS - 1};
+#define AXIS_TICK_COLOR WHITE
+#define VISIBLE_VALUE_PIXELS SCREEN_WIDTH_PIXELS - 1  // 127 =  the number of samples visible on screen
+#define TOTAL_SAMPLES 180//divisible by 4 for Duff's Device
+#define TOTAL_FREQUENCIES_FOR_AVERAGE 4
+#define PROBES 3 //maximum amount of probes. it is actually not written in the code in a very dynamic way, so changing it requires fixes here and there.
+const unsigned int probeColors[] = {BLUE, YELLOW, GREEN}; //CHANGE COLORS OR PINS TO MATCH SOLDERING
+#define ANALOG_INPUT_PIN_1 A1
+#define ANALOG_INPUT_PIN_2 A3
+#define ANALOG_INPUT_PIN_3 A0
+#define INPUT_PORT 3                  //digitalPinToPort(ANALOG_INPUT_PIN_1), when ANALOG_INPUT_PIN_1\2\3 = A0\A1\A3, on my arduino nano
+#define INPUT_BITMASK_1 2             //digitalPinToBitMask(ANALOG_INPUT_PIN_1), when ANALOG_INPUT_PIN_1 = A1, on my arduino nano
+#define INPUT_BITMASK_2 8             //digitalPinToBitMask(ANALOG_INPUT_PIN_2), when ANALOG_INPUT_PIN_2 = A3, on my arduino nano
+#define INPUT_BITMASK_3 1             //digitalPinToBitMask(ANALOG_INPUT_PIN_3), when ANALOG_INPUT_PIN_3 = A0, on my arduino nano
+const volatile uint8_t *INPUT_REGISTER;// = (volatile uint8_t *)pgm_read_word(port_to_input_PGM + INPUT_PORT));
+#define MAX_SAMPLE_DELAY 16383 //the largest value that will produce an accurate delay according to Arduino.cc
+#define ZERO_OFFSET_PIN A7
+#define ZERO_LINE_COLOR 0xDDDD
+byte zeroY = 0;
+int previousZeroOffset, zeroOffset = 0, zeroAmplifyOffset = 0;
+//secondary inputs are used to define the division of the input (how much it is divided by)
+byte voltageBoundariesInputPins[] = {A4 , A5 , A2 };
+float voltageBounds[PROBES * 2], previousVoltageBounds[PROBES * 2];
+
+unsigned long totalSampleTime, previousTotalSampleTime = 0;
+int values[PROBES][TOTAL_SAMPLES];//, previousValues[PROBES][VISIBLE_VALUE_PIXELS] = {0};       // stores read analog values mapped to 0-127
+byte drawFrom = 0, pos = 0;        // pos is the next position in the value array to read
+unsigned long readStartTime = 0;  // time when the current sampling started
+int sampleDelay = 0;
+bool usingDigital = 0, screenUpdateEnabled = 1;
+#define DIGITAL_PROBE_OFFSET 3 //used when drawing usingDigital
+int drawFromTrigger = 1, probes = 1;
+long frequencies[PROBES][TOTAL_FREQUENCIES_FOR_AVERAGE] = {0};
+int currentFrequencyIndex = 0;
+long avgHertz[PROBES] = {0}, previousAvgHertz[PROBES] = {0};
+int displayingKiloHz[PROBES] = {0}, previousDisplayKiloHz[PROBES] = {0};
+boolean ruler = 0;
+
+//menu
+#define VOLTMETER 0
+#define MENU 2
+byte mode = VOLTMETER, setting = 0;
+bool inSetting = 0;
+byte ampAnalogBy = 0;
+#define NUM_OF_MENU_SETTINGS 8
+#define SET_BOUNDS_SETTING NUM_OF_MENU_SETTINGS - 1
+//menu settings: Volt mtr, delay, Dgtl\\Anlg, Frm trggr, probes, ruler, ampAnalog X8, setBounds
+#define SETTING_VALUE_X SCREEN_WIDTH_PIXELS * 3 / 4
+//im using this system instead of interrupts because the arduino nano has only 2 interruptables
+/*schematic: connect each button pin to a button, and the other side of the button to a high resistance resistor (10k) to ground
+  button terminal1 - buttonPin
+  button terminal2 - 10k resistor - ground
+*/
+#define BUTTON_DEBOUNCE_TIME 70 //millis
+#define DELAY_BETWEEN_BUTTON_REPEATS 400 //millis
+const int buttonsPins[] =       {4, 5, 6};
+const int isButtonHeldable[] =  {0, 1, 1};
+int *buttonsPressed, numOfButtons;
+unsigned long *buttonsPressedWhen;
+void VoltMeter() {
+  if (screenUpdateEnabled) {
+    CleanValuesFromScreen();
+    totalSampleTime = ReadSampleBatch();
+  }else{
+    Serial.println("screen update disabled");
+  }
+  if (drawMainVoltMeter()) {
+    MoveValuesToPreviousValuesArray();
+    if (usingDigital) { // && drawFromTrigger) {
+      drawAverageFrequency();
+    }
+  }
+}
+int drawMainVoltMeter() {
+  if (drawSampledValues()) {
+    drawFrameTime(totalSampleTime);
+    return 1;
+  }
+  return 0;
+}
+void drawAxis() {
+  // Draws the graph ticks for the vertical axis
+  for (int i = 0; i < 6; i++) {
+    if (ruler && i != 5) {
+      int y = SCREEN_HEIGHT_PIXELS * ((i + 1) * 2 - 1) / 10;
+      int x = AXIS_TICK_WIDTH - 1;
+      disp.drawLine(0, y, x, y, AXIS_TICK_COLOR);
+      disp.drawLine(SCREEN_WIDTH_PIXELS - 1, y, SCREEN_WIDTH_PIXELS - 1 - x, y, AXIS_TICK_COLOR);
+      disp.drawLine(x + 1 + 1, y, SCREEN_WIDTH_PIXELS - 2 - 1 - x, y, DARK_GRAY);
+    }
+    int tickLength = AXIS_TICK_WIDTH + ruler * 2;
+    disp.drawLine(0, ticks[i], tickLength, ticks[i], AXIS_TICK_COLOR);
+    disp.drawLine(SCREEN_WIDTH_PIXELS - 1, ticks[i], SCREEN_WIDTH_PIXELS - 1 - tickLength, ticks[i], AXIS_TICK_COLOR);
+    disp.drawLine(tickLength + 1 + 1, ticks[i], SCREEN_WIDTH_PIXELS - 2 - 1 - tickLength, ticks[i], GRAY);
+  }
+}
+void drawZeroLine() {
+  disp.drawLine(0, zeroY, SCREEN_WIDTH_PIXELS, zeroY, ZERO_LINE_COLOR);
+}
+void MeasureVoltageBoundaries() {
+  int previousADCSRA = ADCSRA;
+  ADCSRA = (ADCSRA & B11111000) | B00000111;
+  analogRead(ZERO_OFFSET_PIN);
+  previousZeroOffset = zeroOffset;
+  zeroOffset = analogRead(ZERO_OFFSET_PIN);
+  RecalculateZeroAmplifyOffset();
+  zeroY = map(zeroOffset, 0, 1023, SCREEN_HEIGHT_PIXELS - 1, 0);
+  //voltage bounds
+  delay(20);
+  for (int i = 0; i < PROBES; i++) {
+    previousVoltageBounds[i * 2] = voltageBounds[i * 2];
+    previousVoltageBounds[i * 2 + 1] = voltageBounds[i * 2 + 1];
+    int r = analogRead(voltageBoundariesInputPins[i]);
+    if (r <= 1) {
+      r = 1;
+    }
+    voltageBounds[i * 2] = (1023 - zeroOffset) * 5.0 / (r * pow(2,ampAnalogBy));//top bound
+    voltageBounds[i * 2 + 1] = (-zeroOffset) * 5.0 / (r * pow(2,ampAnalogBy));//bottom bound
+    delay(20);
+  }
+  ADCSRA = previousADCSRA;
+}
+void RecalculateZeroAmplifyOffset(){
+  zeroAmplifyOffset = zeroOffset - (zeroOffset >> (3 - ampAnalogBy));
+}
+void drawVoltageBoundaries() {
+  for (int i = 0; i < probes + 1; i++) {
+    disp.setCursor(3, 3);
+    //disp.print(voltageBounds[i * 2]);
+    //disp.print(".");
+    //disp.print(int(floor(voltageBounds[i * 2] * 100)) % 100);
+    disp.setCursor(3, SCREEN_HEIGHT_PIXELS - 1 - (CHAR_HEIGHT + 2));
+    //disp.print(voltageBounds[i * 2 + 1]);
+    //disp.print(".");
+    //disp.print(int(floor(voltageBounds[i * 2 + 1] * 100)) % 100);
+  }
+}
+int drawSampledValues() {
+  drawFrom = 0;
+  if (drawFromTrigger != 0) {
+    if (usingDigital) {
+      // Find the first occurence of zero
+      for (int i = 0; i < TOTAL_SAMPLES; i++) {
+        if (values[drawFromTrigger - 1][i] == 0) {
+          // Now find the next value that is not zero
+          for (; i < TOTAL_SAMPLES; i++) {
+            if (values[drawFromTrigger - 1][i] != 0) {
+              drawFrom = i;
+              break;
+            }
+          }
+          break;
+        }
+      }
+    } else {
+      for (int i = 0; i < TOTAL_SAMPLES - 1; i++) {
+        if ((values[drawFromTrigger - 1][i] < (zeroOffset >> 3)) && (values[drawFromTrigger - 1][i + 1] >= (zeroOffset >> 3)) && (values[drawFromTrigger - 1][i] < values[drawFromTrigger - 1][i + 1])) {
+          drawFrom = i;
+          break;
+        }
+      }
+    }
+    // If the trigger point is not within half of our values, we will
+    // not have enough sample points to show the wave correctly
+    if (drawFrom >= TOTAL_SAMPLES / 2)
+      return 0;
+  }
+  CleanVoltMeterScreen();
+  if (!usingDigital) {
+    drawAxis();
+    drawZeroLine();
+    drawVoltageBoundaries();
+  }
+  for (int j = 0; j < probes; j++) {
+    for (int i = 0; i < VISIBLE_VALUE_PIXELS; i++) {
+      disp.drawPixel(i, ValueToY(values[j][i + drawFrom], j), probeColors[j]);
+    }
+  }
+  return 1;
+}
+int ValueToY(int val, int probe) {//value to Y coordinate on screen
+  if (usingDigital) {
+    if ((val == INPUT_BITMASK_1 && probe == 1 - 1) || (val == INPUT_BITMASK_2 && probe == 2 - 1) || (val == INPUT_BITMASK_3 && probe == 3 - 1)) {
+      return probe * DIGITAL_PROBE_OFFSET + 1;
+    } else {
+      return SCREEN_HEIGHT_PIXELS - 1 - (probe * DIGITAL_PROBE_OFFSET);
+    }
+  } else {
+    return SCREEN_HEIGHT_PIXELS - 1 - (val * (1 + usingDigital * (SCREEN_HEIGHT_PIXELS - 2)));
+  }
+}
+long getFrequency(int probe, unsigned long us) {
+  //this method assumes the measurements are actually of a normal repeating wave and not a PWM for example.
+  //calculates frequency using the total time taken to sample the values, and the amount of high times.
+  //returned value is in Hz
+  int counter = -1, firstRising = 0, lastRising = 0;
+  /*
+    Serial.print(",drawFrom = ");
+    Serial.print(drawFrom);
+    Serial.print(", values:    \t");
+  */
+  for (int i = 0; i < VISIBLE_VALUE_PIXELS; i++) {
+    if (values[probe][i + drawFrom] && ((i + drawFrom) == 0 || !values[probe][i - 1 + drawFrom])) {//rising
+      //Serial.print("^");
+      if (counter == -1) {
+        firstRising = i;
+      }
+      lastRising = i;
+      counter++;
+    }
+    //Serial.print(values[i + drawFrom]);
+  }
+  /*
+    Serial.print(", counter = ");
+    Serial.print(counter);
+    Serial.print(", rising = (");
+    Serial.print(firstRising);
+    Serial.print(",");
+    Serial.print(lastRising);
+    Serial.print("), tempBeforeTime = ");
+  */
+  long temp = counter * 1000000 / us;
+  //Serial.print(temp);
+  temp *= VISIBLE_VALUE_PIXELS;
+  temp /= (lastRising - firstRising);
+  /*
+    Serial.print(", tempFinal = ");
+    Serial.println(temp);
+  */
+  if (firstRising == lastRising) {
+    return 0;
+  }
+  return temp;
+}
+void drawAverageFrequency() {
+  for (int i = 0; i < probes; i++) {
+    frequencies[i][currentFrequencyIndex] = getFrequency(i, totalSampleTime);
+    avgHertz[i] = 0;
+    for (int j = 0; j < TOTAL_FREQUENCIES_FOR_AVERAGE; j++) {
+      avgHertz[i] += frequencies[i][j];
+    }
+    avgHertz[i] /= TOTAL_FREQUENCIES_FOR_AVERAGE;
+  }
+  CleanFrequency();
+  for (int i = 0; i < probes; i++) {
+    disp.setTextColor(probeColors[i]);
+    disp.setCursor(SCREEN_WIDTH_PIXELS - 2 - 2 * (CHAR_WIDTH + 1), FREQ_Y - i * (CHAR_HEIGHT + 1));
+    disp.print("Hz");
+    disp.setCursor(FREQ_X, FREQ_Y - i * (CHAR_HEIGHT + 1));
+    if (avgHertz[i] > 3000) {
+      displayingKiloHz[i] = 1;
+      disp.print(avgHertz[i] / 1000);
+      disp.print("k");
+    } else {
+      displayingKiloHz[i] = 0;
+      disp.print(avgHertz[i]);
+    }
+  }
+  currentFrequencyIndex = (currentFrequencyIndex + 1) % TOTAL_FREQUENCIES_FOR_AVERAGE;
+}
+void drawFrameTime(unsigned long us) {
+  // Shows the time taken to sample the values shown on screen
+  disp.setTextColor(WHITE);
+  disp.setCursor(SCREEN_WIDTH_PIXELS - 2 - 2 * (CHAR_WIDTH + 1), FRAME_TIME_Y);
+  disp.print("uS");
+  disp.setCursor(FRAME_TIME_X, FRAME_TIME_Y); // almost at bottom, approximately centered
+  disp.print(us);
+}
+
+void InitializeButtons() {
+  numOfButtons = sizeof(buttonsPins) / sizeof(buttonsPins[0]);
+  buttonsPressed = new int[numOfButtons];
+  buttonsPressedWhen = new unsigned long[numOfButtons];
+  for (int i = 0; i < numOfButtons; i++) {
+    pinMode(buttonsPins[i], INPUT_PULLUP);
+    buttonsPressed[i] = 0;
+    buttonsPressedWhen[i] = 0;
+  }
+}
+void ManageButtonsInput() {
+  for (int i = 0; i < numOfButtons; i++) {
+    if (!digitalRead(buttonsPins[i])) { //digitalRead inverted because the buttons are INPUT_PULLUP
+      if (!buttonsPressed[i] || (isButtonHeldable[i] && millis() - buttonsPressedWhen[i] > DELAY_BETWEEN_BUTTON_REPEATS)) {
+        ButtonPressed(i);
+        buttonsPressed[i] = 1;
+        buttonsPressedWhen[i] = millis();
+      }
+    } else {
+      if (millis() - buttonsPressedWhen[i] > BUTTON_DEBOUNCE_TIME) {
+        buttonsPressed[i] = 0;
+      }
+    }
+  }
+
+}
+void ButtonPressed(int buttonIndex) {
+  //Serial.print("pressed");
+  switch (buttonIndex) {//make a case #: for each button
+    case 0:
+      switch (mode) {
+        case VOLTMETER:
+          //open menu
+          disp.fillScreen(BLACK);
+          mode = MENU;
+          setting = 0;
+          inSetting = 0;
+          DrawMenu(true);
+          break;
+        case MENU:
+          CleanMenu();
+          MenuSelect();
+          break;
+      }
+      break;
+    case 1:
+      switch (mode) {
+        case MENU:
+          CleanMenu();
+          InMenu(1);
+          break;
+      }
+      break;
+    case 2:
+      switch (mode) {
+        case VOLTMETER:
+          screenUpdateEnabled = !screenUpdateEnabled;
+          break;
+        case MENU:
+          CleanMenu();
+          InMenu(-1);
+          break;
+      }
+      break;
+  }
+}
+void InMenu(int ud) {
+  //SYNC WITH menu settings
+  if (inSetting) {
+    ud = -ud;
+    switch (setting) {
+      case 1:
+        sampleDelay = max(0, min(sampleDelay + ud, MAX_SAMPLE_DELAY));
+        DrawMenu(true);
+        break;
+      case 3:
+        drawFromTrigger = max(0, min(drawFromTrigger + ud, probes));
+        DrawMenu(true);
+        break;
+      case 4:
+        SetProbes(max(1, min(probes + ud, PROBES)));
+        DrawMenu(true);
+        break;
+      case SET_BOUNDS_SETTING - 1:
+        ampAnalogBy = max(0, min(ampAnalogBy + ud, 3));
+        RecalculateZeroAmplifyOffset();
+        DrawMenu(true);
+        break;
+      default:
+        DrawMenu(true);
+        break;
+    }
+  } else {
+    setting = max(0, min(setting + ud, NUM_OF_MENU_SETTINGS - 1));
+    DrawMenu(true);
+  }
+}
+void SetProbes(int num) {
+  probes = num;
+  drawFromTrigger = min(drawFromTrigger, probes);
+  //speed up Analog to Digital converter according to probes
+  switch (probes) {
+    case 1://fast ADC
+      ADCSRA = (ADCSRA & B11111000) | B00000010;
+      break;
+    case 3: case 2://less fast adc
+      ADCSRA = (ADCSRA & B11111000) | B00000100;
+      break;
+  }
+}
+void MenuSelect() {
+  //SYNC WITH menu settings
+  if (inSetting) {
+    inSetting = 0;
+    switch (setting) {
+      case 0:
+        mode = VOLTMETER;
+        disp.fillScreen(BLACK);
+        VoltMeter();//draw even if !screenUpdateEnabled
+        break;
+      case 2:
+        usingDigital = !usingDigital;
+        DrawMenu(true);
+        break;
+      case 5:
+        ruler = !ruler;
+        DrawMenu(true);
+        break;
+      default:
+        DrawMenu(true);
+        break;
+    }
+  } else {
+    inSetting = 1;
+    DrawMenu(true);
+  }
+}
+void DrawMenu(bool drawAnyway) {
+  //SYNC WITH menu settings
+  //ASSUMING THE SCREEN IS LARGE ENOUGH TO DISPLAY ALL SETTINGS AT ONCE
+  disp.setTextColor(WHITE);
+  for (int i = 0; i < NUM_OF_MENU_SETTINGS; i++) {
+    if (setting == i) {
+      disp.drawPixel(0, (CHAR_HEIGHT + 2) * i + 3, WHITE);
+      disp.drawPixel(1, (CHAR_HEIGHT + 2) * i + 3, WHITE);
+      if (inSetting) {
+        disp.drawPixel(4, (CHAR_HEIGHT + 2) * i + 3, WHITE);
+        disp.drawPixel(5, (CHAR_HEIGHT + 2) * i + 3, WHITE);
+      }
+    }
+    disp.setCursor(8, (CHAR_HEIGHT + 2) * i);
+    switch (i) {
+      case 0:
+        disp.print("Oscilloscope");
+        break;
+      case 1:
+        disp.print("Delay");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print(sampleDelay);
+        break;
+      case 2:
+        disp.print("Analog");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print(!usingDigital);
+        break;
+      case 3:
+        disp.print("Frm Trggr");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print(drawFromTrigger);
+        break;
+      case 4:
+        disp.print("probes");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print(probes);
+        break;
+      case 5:
+        disp.print("ruler");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print(ruler);
+        break;
+      case SET_BOUNDS_SETTING - 1:
+        disp.print("amp Analog");
+        disp.setCursor(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * i);
+        disp.print("X");
+        disp.print((int)round(pow(2, ampAnalogBy)));
+        break;
+      case SET_BOUNDS_SETTING: //this will always be the last setting
+        disp.print("Set Bounds and Zero");
+        if ((setting == i) && inSetting) {
+          RedrawSetBoundsSetting(true);
+        }
+        break;
+    }
+  }
+}
+void RedrawSetBoundsSetting(bool drawAnyway) {
+  int digits = 6;//for the voltage bounds, not the zero
+  disp.setTextColor(WHITE);
+  disp.setCursor(8, (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 1));
+  disp.print("Disc");
+  disp.print("onnect probes");
+  disp.setCursor(0, (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 2));
+  MeasureVoltageBoundaries();
+  disp.print("0: ");
+  if (drawAnyway || (previousZeroOffset != zeroOffset)) {
+    disp.fillRect(3 * CHAR_WIDTH, (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 2), 4 * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2), BLACK);
+    disp.print(zeroOffset);
+  }
+  disp.setCursor(8 * CHAR_WIDTH + 2, (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 2));
+  disp.print("/1023");
+  //top bounds
+  for (int j = 0; j < PROBES; j++) {
+    if (drawAnyway || (previousVoltageBounds[j * 2] != voltageBounds[j * 2])) {
+      disp.fillRect(j * digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 3), digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2), BLACK);
+      disp.setTextColor(probeColors[j]);
+      disp.setCursor(j * digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 3));
+      disp.print(voltageBounds[j * 2], 1);
+    }
+  }
+  //bottom bounds
+  for (int j = 0; j < PROBES; j++) {
+    if (drawAnyway || (previousVoltageBounds[j * 2 + 1] != voltageBounds[j * 2 + 1])) {
+      disp.fillRect(j * digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 4), digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2), BLACK);
+      disp.setTextColor(probeColors[j]);
+      disp.setCursor(j * digits * (CHAR_WIDTH + 2), (CHAR_HEIGHT + 2) * (SET_BOUNDS_SETTING + 4));
+      disp.print(voltageBounds[j * 2 + 1], 1);
+    }
+  }
+}
+void CleanMenu() {
+  //SYNC with DrawMenu
+  disp.drawLine(0, (CHAR_HEIGHT + 2) * setting + 3, 5, (CHAR_HEIGHT + 2) * setting + 3, BLACK);
+  switch (setting) {
+    case 1: case 6:
+      disp.fillRect(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * setting, SCREEN_WIDTH_PIXELS - 1 - SETTING_VALUE_X, (CHAR_HEIGHT + 2), BLACK);
+      break;
+    case 2: case 3: case 5:
+      disp.fillRect(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * setting, CHAR_WIDTH, (CHAR_HEIGHT + 2), BLACK);
+      break;
+    case 4://also erase the previous setting becuase probes can change fromTrggr
+      disp.fillRect(SETTING_VALUE_X, (CHAR_HEIGHT + 2) * (setting - 1), CHAR_WIDTH, (CHAR_HEIGHT + 2) * 2, BLACK);
+      break;
+    case SET_BOUNDS_SETTING: //erase 4 lines
+      disp.fillRect(0, (CHAR_HEIGHT + 2) * (setting + 1), SCREEN_WIDTH_PIXELS, (CHAR_HEIGHT + 2) * 4, BLACK);
+      break;
+  }
+}
+unsigned long ReadSampleBatch() {
+  //divided into ifs because its faster than having the if inside the loop
+  /*
+     optimization:
+     instead of digitalRead(ANALOG_INPUT_PIN)
+     use
+   * *portInputRegister(digitalPinToPort(ANALOG_INPUT_PIN)) & digitalPinToBitMask(ANALOG_INPUT_PIN)
+     and optimize even further to
+   * *portInputRegister(INPUT_PORT) & INPUT_BITMASK
+     with preset INPUT_PORT and INPUT_BITMASK
+     and then further improve with
+   * *INPUT_REGISTER & INPUT_BITMASK;
+     when INPUT_REGISTER is a const variable which was initially set as portInputRegister(INPUT_PORT)
+  */
+  pos = 0;
+  unsigned long ret;
+  if (usingDigital) {
+    byte tmpVal;
+    if (sampleDelay != 0) {
+      readStartTime = micros();
+      for (; pos < TOTAL_SAMPLES;) {
+        values[0][pos++] = *INPUT_REGISTER;
+        delayMicroseconds(sampleDelay);
+      }
+      ret = micros();
+    } else {
+      readStartTime = micros();
+      for (; pos < TOTAL_SAMPLES; pos += 4) {
+        values[0][pos] = *INPUT_REGISTER;
+        values[0][pos + 1] = *INPUT_REGISTER;
+        values[0][pos + 2] = *INPUT_REGISTER;
+        values[0][pos + 3] = *INPUT_REGISTER;
+      }
+      ret = micros();
+    }
+  } else {
+    if (sampleDelay != 0) {
+      switch (probes) { //PROBES amount of cases
+        case 1:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES;) {
+            values[0][pos++] = analogRead(ANALOG_INPUT_PIN_1);
+            delayMicroseconds(sampleDelay);
+          }
+          ret = micros();
+          break;
+        case 2:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES;) {
+            values[0][pos] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos++] = analogRead(ANALOG_INPUT_PIN_2);
+            delayMicroseconds(sampleDelay);
+          }
+          ret = micros();
+          break;
+        case 3:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES;) {
+            values[0][pos] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos] = analogRead(ANALOG_INPUT_PIN_2);
+            values[2][pos++] = analogRead(ANALOG_INPUT_PIN_3);
+            delayMicroseconds(sampleDelay);
+          }
+          ret = micros();
+          break;
+        }
+    } else {
+      int tmpLimit;
+      switch (probes) { //PROBES amount of cases
+        case 1:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES; pos += 4) {   
+            values[0][pos] = analogRead(ANALOG_INPUT_PIN_1);
+            values[0][pos + 1] = analogRead(ANALOG_INPUT_PIN_1);
+            values[0][pos + 2] = analogRead(ANALOG_INPUT_PIN_1);
+            values[0][pos + 3] = analogRead(ANALOG_INPUT_PIN_1);
+          }
+          ret = micros();
+          break;
+        case 2:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES; pos += 4) {
+            values[0][pos] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos] = analogRead(ANALOG_INPUT_PIN_2);
+            values[0][pos + 1] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 1] = analogRead(ANALOG_INPUT_PIN_2);
+            values[0][pos + 2] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 2] = analogRead(ANALOG_INPUT_PIN_2);
+            values[0][pos + 3] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 3] = analogRead(ANALOG_INPUT_PIN_2);
+          }
+          ret = micros();
+          break;
+        case 3:
+          readStartTime = micros();
+          for (; pos < TOTAL_SAMPLES;pos += 4) {
+            values[0][pos] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos] = analogRead(ANALOG_INPUT_PIN_2);
+            values[2][pos] = analogRead(ANALOG_INPUT_PIN_3);
+            values[0][pos + 1] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 1] = analogRead(ANALOG_INPUT_PIN_2);
+            values[2][pos + 1] = analogRead(ANALOG_INPUT_PIN_3);
+            values[0][pos + 2] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 2] = analogRead(ANALOG_INPUT_PIN_2);
+            values[2][pos + 2] = analogRead(ANALOG_INPUT_PIN_3);
+            values[0][pos + 3] = analogRead(ANALOG_INPUT_PIN_1);
+            values[1][pos + 3] = analogRead(ANALOG_INPUT_PIN_2);
+            values[2][pos + 3] = analogRead(ANALOG_INPUT_PIN_3);
+          }
+          ret = micros();
+          break;
+        }
+    }
+  }
+  //values post processing
+  if (!usingDigital) {
+    if (ampAnalogBy == 0){
+      for (int i = 0; i < probes; i++){
+        for (int j = 0; j < TOTAL_SAMPLES; j++){
+          values[i][j] = values[i][j] >> 3; //shifting from 0-1023 to 0-127
+        }
+      }
+    }else{
+      byte shiftBy = 3 - ampAnalogBy;
+      for (int i = 0; i < probes; i++){
+        for (int j = 0; j < TOTAL_SAMPLES; j++){
+          values[i][j] = min(127, max(0, (values[i][j] - zeroAmplifyOffset) >> shiftBy)); //shifting from 0-1023 to 0-127 or 0-255 or 0-511, centering around the 0 line, and then fitting it to 0-127
+        }
+      }
+    }
+  }else{
+    int tmpVal;
+    for (int i = 0; i < TOTAL_SAMPLES; i++){
+      tmpVal = values[0][i];
+      //the values are left as INPUT_BITMASK_#, and not shifted right to 1, intentionally. it is handled in ValueToY
+      values[0][i] = (tmpVal & INPUT_BITMASK_1);
+      values[1][i] = (tmpVal & INPUT_BITMASK_2);
+      values[2][i] = (tmpVal & INPUT_BITMASK_3);
+    }
+  }
+  return (ret - readStartTime) * 10 /14;// (((float)TOTAL_SAMPLES) / VISIBLE_VALUE_PIXELS)));// Divide by the ratio of samples and pixels because we are taking <ratio> as many samples as are shown on the screen.
+}
+void MoveValuesToPreviousValuesArray() {
+  previousTotalSampleTime = totalSampleTime;
+  for (int j = 0; j < probes; j++) {
+    previousAvgHertz[j] = avgHertz[j];
+    previousDisplayKiloHz[j] = displayingKiloHz[j];
+    /*
+    for (int i = 0; i < VISIBLE_VALUE_PIXELS; i++) {
+      previousValues[j][i] = values[j][i + drawFrom];
+    }
+    */
+  }
+}
+void CleanVoltMeterScreen() {
+  if (previousTotalSampleTime != totalSampleTime) {
+    int totalSampleTimeLetters = 2;
+    unsigned long tmp = totalSampleTime;
+    while (tmp > 0) {
+      totalSampleTimeLetters++;
+      tmp /= 10;
+    }
+    disp.fillRect(FRAME_TIME_X, FRAME_TIME_Y, /*rect width*/totalSampleTimeLetters * (CHAR_WIDTH + 1) - 2, /*rect height*/CHAR_HEIGHT - 1, BLACK);
+  }
+  //CleanValuesFromScreen();
+  //clean the zeroY line
+  disp.drawLine(0, zeroY, SCREEN_WIDTH_PIXELS, zeroY, BLACK);
+}
+void CleanValuesFromScreen() {
+  for (int j = 0; j < probes; j++) {
+    for (int i = 0; i < VISIBLE_VALUE_PIXELS; i++) {
+      disp.drawPixel(i, ValueToY(values[j][i], j), BLACK);
+    }
+  }
+  //for some reason the values on i = 1 arent deleted
+  //disp.drawLine(1, 0, 1, SCREEN_HEIGHT_PIXELS - 1, BLACK);
+}
+void CleanFrequency() {
+  if (usingDigital) {
+    for (int i = 0; i < probes; i++) {
+      if (!(previousAvgHertz[i] == 0 && avgHertz[i] == 0)) {
+        if (!((displayingKiloHz[i] && previousDisplayKiloHz[i] && avgHertz[i] / 1000 == previousAvgHertz[i] / 1000) || (!displayingKiloHz[i] && !previousDisplayKiloHz[i] && avgHertz[i] == previousAvgHertz[i]))) {
+          int totalFreqLetters = 1 + 1;//erase an extra letter from the previous reading
+          unsigned long tmp = previousAvgHertz[i];
+          while (tmp > 0 + 1000 * previousDisplayKiloHz[i]) {
+            totalFreqLetters++;
+            tmp /= 10;
+          }
+          disp.fillRect(FREQ_X, FREQ_Y - i * (CHAR_HEIGHT + 2), /*rect width*/(totalFreqLetters) * (CHAR_WIDTH + 1) - 2, /*rect height*/CHAR_HEIGHT - 1 + i * (CHAR_HEIGHT + 2), BLACK);
+        }
+      }
+
+    }
+  }
+}
+void () {
+  Serial.begin(9600);
+  //for optimization in readings
+  INPUT_REGISTER = portInputRegister(INPUT_PORT);
+  SetProbes(probes);//includes speeding up of ADC
+  disp.begin();
+  pinMode(ANALOG_INPUT_PIN_1, INPUT);
+  pinMode(ANALOG_INPUT_PIN_2, INPUT);
+  pinMode(ANALOG_INPUT_PIN_3, INPUT);
+  pinMode(ZERO_OFFSET_PIN, INPUT);
+  for (int i = 0; i < PROBES; i++) {
+    pinMode(voltageBoundariesInputPins[i], INPUT);
+  }
+  InitializeButtons();
+  MeasureVoltageBoundaries();
+  disp.fillScreen(BLACK);
+}
+
+void loop() {
+  ManageButtonsInput();
+  switch (mode) {
+    case VOLTMETER:
+      if (screenUpdateEnabled) {
+        VoltMeter();
+        //delay(30 - 5 * probes);
+      }
+      break;
+    case MENU:
+      if (inSetting && (setting == SET_BOUNDS_SETTING)) {
+        RedrawSetBoundsSetting(false);
+      }
+      break;
+  }
+}
